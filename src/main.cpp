@@ -23,6 +23,8 @@ constexpr int PANEL_W = 400, PANEL_X = IMG_W - PANEL_W, ROW_H = 60;
 constexpr int COL_VIS = PANEL_X + 200, COL_DEL = PANEL_X + 300;
 constexpr int PANEL_LAST_ROW = IMG_H / ROW_H - 1;
 constexpr uint8_t kPenWidths[] = {2, 5, 10};
+constexpr uint8_t kStampSizes[] = {12, 20, 30};  // 丸ポチの直径。「太さ」と同じ 3 段階
+static_assert(sizeof(kPenWidths) == sizeof(kStampSizes), "太さの段階数を揃える");
 constexpr int kEraserRadius = 14;
 constexpr uint32_t kSaveDelayMs = 3000;
 
@@ -35,7 +37,7 @@ constexpr int kChoiceCount = 5;
 constexpr int CHOICE_W = PANEL_W / kChoiceCount;
 
 enum Btn { B_TOOL, B_WIDTH, B_LAYER, B_UNDO, B_PREV, B_NEXT, B_REFRESH, B_WIFI, B_STATUS, BTN_COUNT };
-enum class Tool { Pen, Eraser };
+enum class Tool { Pen, Eraser, Stamp };  // Stamp: 触れた所に丸ポチを 1 つ置く（滑っても線にならない）
 enum class Overlay { None, Layers, Info, Settings };
 
 M5Canvas baseCanvas(&M5.Display);     // 元画像
@@ -149,7 +151,7 @@ void drawLabel(const char* text, int cx, int cy, const lgfx::IFont* font, uint16
 void drawButton(int i) {
   auto& d = M5.Display;
   int y = i * BTN_H, cx = TB_X + TB_W / 2, cy = y + BTN_H / 2;
-  bool inv = (i == B_TOOL && tool == Tool::Eraser) || (i == B_LAYER && overlay == Overlay::Layers) ||
+  bool inv = (i == B_TOOL && tool != Tool::Pen) || (i == B_LAYER && overlay == Overlay::Layers) ||
              (i == B_WIFI && overlay == Overlay::Info) || (i == B_STATUS && overlay == Overlay::Settings);
   uint16_t bg = inv ? TFT_BLACK : TFT_WHITE, fg = inv ? TFT_WHITE : TFT_BLACK;
   d.fillRect(TB_X, y, TB_W, BTN_H, bg);
@@ -158,11 +160,17 @@ void drawButton(int i) {
   switch (i) {
     case B_TOOL:
       if (tool == Tool::Pen) drawLabel("ペン", cx, cy, fontL, fg, bg);
-      else drawLabel("消しゴム", cx, cy, fontS, fg, bg);
+      else if (tool == Tool::Eraser) drawLabel("消しゴム", cx, cy, fontS, fg, bg);
+      else drawLabel("丸ポチ", cx, cy, fontS, fg, bg);
       break;
     case B_WIDTH:
-      drawLabel("太さ", cx, y + 16, fontS, fg, bg);
-      d.drawWideLine(TB_X + 14, y + 40, TB_X + TB_W - 14, y + 40, kPenWidths[widthIdx] / 2.0f, fg);
+      if (tool == Tool::Stamp) {
+        drawLabel("大きさ", cx, y + 12, fontS, fg, bg);
+        d.fillCircle(cx, y + 38, kStampSizes[widthIdx] / 2, fg);
+      } else {
+        drawLabel("太さ", cx, y + 16, fontS, fg, bg);
+        d.drawWideLine(TB_X + 14, y + 40, TB_X + TB_W - 14, y + 40, kPenWidths[widthIdx] / 2.0f, fg);
+      }
       break;
     case B_LAYER:
       drawLabel("レイヤー", cx, y + 18, fontS, fg, bg);
@@ -535,12 +543,17 @@ void onSettingsTap(int x, int y) {
 void onToolbar(int i) {
   switch (i) {
     case B_TOOL:
-      tool = tool == Tool::Pen ? Tool::Eraser : Tool::Pen;
-      updateButton(B_TOOL);
+      // ペン → 消しゴム → 丸ポチ → ペン
+      tool = tool == Tool::Pen ? Tool::Eraser : (tool == Tool::Eraser ? Tool::Stamp : Tool::Pen);
+      M5.Display.setEpdMode(epd_mode_t::epd_fast);
+      M5.Display.startWrite();
+      drawButton(B_TOOL);
+      drawButton(B_WIDTH);  // 丸ポチでは「大きさ」の見本になる
+      M5.Display.endWrite();
       break;
     case B_WIDTH:
       widthIdx = (widthIdx + 1) % (int)sizeof(kPenWidths);
-      if (tool == Tool::Eraser) {
+      if (tool == Tool::Eraser) {  // 消しゴムに太さは無いのでペンに戻す
         tool = Tool::Pen;
         updateButton(B_TOOL);
       }
@@ -599,7 +612,11 @@ void flushPending() {
   // DU4(fastest) は灰色の上の画素を取りこぼすことがあるので白黒 2 値の DU(fast) で描く
   M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.startWrite();
-  for (auto& s : pendingSegs) M5.Display.drawWideLine(s.a.x, s.a.y, s.b.x, s.b.y, s.width / 2.0f, TFT_BLACK);
+  for (auto& s : pendingSegs) {
+    // 点は drawStroke() の 1 点描画と同じ形にする
+    if (s.a.x == s.b.x && s.a.y == s.b.y) M5.Display.fillCircle(s.a.x, s.a.y, std::max(1, s.width / 2), TFT_BLACK);
+    else M5.Display.drawWideLine(s.a.x, s.a.y, s.b.x, s.b.y, s.width / 2.0f, TFT_BLACK);
+  }
   Rect e = pendingErase.clipped(IMG_W, IMG_H);
   if (!e.empty()) {
     M5.Display.setClipRect(e.x, e.y, e.w, e.h);
@@ -632,7 +649,8 @@ void refreshWhenIdle() {
 }
 
 void penSegment(Point a, Point b) {
-  composeCanvas.drawWideLine(a.x, a.y, b.x, b.y, curStroke.width / 2.0f, TFT_BLACK);
+  if (a.x == b.x && a.y == b.y) composeCanvas.fillCircle(a.x, a.y, std::max(1, curStroke.width / 2), TFT_BLACK);
+  else composeCanvas.drawWideLine(a.x, a.y, b.x, b.y, curStroke.width / 2.0f, TFT_BLACK);
   pendingSegs.push_back({a, b, curStroke.width});
   flushPending();
 }
@@ -659,10 +677,11 @@ void beginStroke(int x, int y) {
   }
   drawing = true;
   lastPt = {(int16_t)x, (int16_t)y};
-  if (tool == Tool::Pen) {
+  if (tool == Tool::Pen || tool == Tool::Stamp) {
+    // 丸ポチは 1 点だけの線として保存する（消しゴム・戻す・レイヤーがそのまま効く）
     curStroke = Stroke();
     curStroke.layerId = doc.activeLayer().id;
-    curStroke.width = kPenWidths[widthIdx];
+    curStroke.width = tool == Tool::Stamp ? kStampSizes[widthIdx] : kPenWidths[widthIdx];
     curStroke.pts.push_back(lastPt);
     penSegment(lastPt, lastPt);
   } else {
@@ -672,6 +691,7 @@ void beginStroke(int x, int y) {
 }
 
 void continueStroke(int x, int y) {
+  if (tool == Tool::Stamp) return;  // 指が滑っても線にしない
   Point p = {(int16_t)std::min(std::max(x, 0), IMG_W - 1), (int16_t)std::min(std::max(y, 0), IMG_H - 1)};
   int dx = p.x - lastPt.x, dy = p.y - lastPt.y;
   if (dx * dx + dy * dy < 4) return;
@@ -688,7 +708,7 @@ void continueStroke(int x, int y) {
 void endStroke() {
   drawing = false;
   bool hadUndo = !doc.undoStack.empty();
-  if (tool == Tool::Pen) {
+  if (tool == Tool::Pen || tool == Tool::Stamp) {
     doc.commitStroke(std::move(curStroke));
     pendingRefresh.unite(doc.strokes.back().bounds);
   } else {
@@ -847,7 +867,7 @@ void setup() {
 
   if (!store::begin()) fatal("ストレージを初期化できません");
   settings::load();
-  tool = settings::get().tool ? Tool::Eraser : Tool::Pen;
+  tool = settings::get().tool <= (uint8_t)Tool::Stamp ? (Tool)settings::get().tool : Tool::Pen;
   widthIdx = settings::get().widthIdx % sizeof(kPenWidths);
   // 電源オフからの再開。画面は残っているので「起動中」表示は出さない。
   // ただし IT8951 は電源断で表示状態を忘れており、部分更新すると掠れるため全面を描き直す

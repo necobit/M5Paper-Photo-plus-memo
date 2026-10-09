@@ -4,6 +4,9 @@
 #include <LittleFS.h>
 #include <M5Unified.h>
 
+#include <driver/gpio.h>
+#include <esp_sleep.h>
+
 #include <algorithm>
 
 #include "app.h"
@@ -50,6 +53,19 @@ Rect pendingRefresh;           // 書き終えた範囲。手が止まったら�
 uint32_t refreshDueMs = 0;
 bool undoButtonStale = false;
 constexpr uint32_t kRefreshIdleMs = 800;
+
+// 操作が無いとライトスリープ（RAM の状態は保持、e-ink は表示を保持）。タッチか側面スイッチで復帰
+constexpr uint32_t kSleepAfterMs = 30000;
+constexpr uint32_t kSleepAfterInfoMs = 180000;  // 「送る」画面を表示中は iPhone 操作を待つので長め
+constexpr gpio_num_t kButtonPins[] = {GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39};  // 側面スイッチ 上/押し/下
+uint32_t lastActivityMs = 0;
+
+// Wi-Fi は「送る」画面を開いた時だけ付け、iPhone からの通信が途絶えたら切る
+constexpr uint32_t kWifiOffAfterMs = 60000;
+uint32_t lastWebMs = 0;
+bool infoStale = false;  // Wi-Fi の状態が変わり「送る」画面の描き直しが必要
+bool sleeping = false;
+bool wakeGuard = false;  // 起こしたタッチ / スイッチ操作を離すまで無視する
 uint32_t saveDueMs = 0;
 uint32_t statusDueMs = 0;
 
@@ -149,6 +165,11 @@ void drawButton(int i) {
     case B_REFRESH: drawLabel("更新", cx, cy, fontL, fg, bg); break;
     case B_WIFI: drawLabel("送る", cx, cy, fontL, fg, bg); break;
     case B_STATUS: {
+      if (sleeping) {
+        drawLabel("スリープ", cx, y + 18, fontS, fg, bg);
+        drawLabel("中", cx, y + 42, fontS, fg, bg);  // 幅 80px に収まる表記
+        break;
+      }
       auto ids = store::list();
       int pos = std::find(ids.begin(), ids.end(), currentId) - ids.begin();
       if (currentId && pos < (int)ids.size()) snprintf(buf, sizeof(buf), "%d/%d", pos + 1, (int)ids.size());
@@ -233,6 +254,11 @@ void drawInfo() {
     d.drawString(s, 30, y);
     y += 26;
   };
+  if (web::state() != web::State::Ready) {
+    line("Wi-Fi に接続しています…");
+    line("家の Wi-Fi に繋がらない場合は、15 秒後に M5Paper 自身がアクセスポイントになります");
+    return;
+  }
   if (web::isAccessPoint()) {
     line("1. iPhone の Wi-Fi で「" + web::ssid() + "」に接続");
     line("   パスワード: " + web::apPassword() + "（左の QR をカメラで読んでも OK）");
@@ -270,6 +296,7 @@ Rect takePending() {
 
 void redrawAll(epd_mode_t mode = epd_mode_t::epd_quality) {
   takePending();
+  infoStale = false;
   compose(kImageRect);
   M5.Display.waitDisplay();
   M5.Display.setEpdMode(mode);
@@ -298,6 +325,11 @@ void showBusy(const char* msg) {
 
 // ---------------------------------------------------------------- データ
 
+void startWifi() {
+  lastWebMs = millis();
+  web::start();
+}
+
 void saveNow() {
   saveDueMs = 0;
   if (currentId && doc.dirty) doc.save(LittleFS, store::memoPath(currentId).c_str());
@@ -317,6 +349,7 @@ void openPhoto(uint16_t id) {
     currentId = 0;
     doc.reset();
     overlay = Overlay::Info;
+    startWifi();
   }
   redrawAll();
 }
@@ -447,6 +480,7 @@ void onToolbar(int i) {
         if (currentId) closeOverlayAndRedraw();
       } else {
         overlay = Overlay::Info;
+        startWifi();
         redrawAll(epd_mode_t::epd_fast);
       }
       break;
@@ -562,6 +596,7 @@ void endStroke() {
 
 void handleTouch() {
   auto t = M5.Touch.getDetail();
+  if (t.isPressed()) lastActivityMs = millis();
   if (drawing) {
     if (t.isPressed()) {
       continueStroke(t.x, t.y);
@@ -587,6 +622,38 @@ void handleTouch() {
   }
 }
 
+void enterSleep() {
+  // 表示待ちを出し切り、高速更新で荒れた部分も整えてから眠る
+  Rect r = takePending();
+  if (overlay == Overlay::Layers) r = r.clipped(PANEL_X, IMG_H);
+  if (overlay != Overlay::Info && !r.empty()) {
+    M5.Display.setEpdMode(epd_mode_t::epd_text);
+    pushImage(r);
+  }
+  saveNow();
+  sleeping = true;
+  M5.Display.waitDisplay();
+  updateButton(B_STATUS);
+  M5.Display.waitDisplay();
+  Serial.println("sleep");
+  Serial.flush();
+
+  web::stop();
+  M5.Display.sleep();
+  for (auto pin : kButtonPins) gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  M5.Power.lightSleep(m5::Power_Class::sleep_no_timer, true);  // タッチ INT(GPIO36) でも復帰
+  for (auto pin : kButtonPins) gpio_wakeup_disable(pin);
+
+  Serial.printf("wakeup cause=%d\n", (int)esp_sleep_get_wakeup_cause());
+  M5.Display.wakeup();
+  sleeping = false;
+  wakeGuard = true;
+  if (overlay == Overlay::Info) startWifi();  // 「送る」画面のまま眠った場合は Wi-Fi を付け直す
+  updateButton(B_STATUS);
+  lastActivityMs = millis();
+}
+
 void fatal(const char* msg) {
   M5.Display.setEpdMode(epd_mode_t::epd_quality);
   M5.Display.clear(TFT_WHITE);
@@ -602,6 +669,8 @@ uint16_t appCurrentId() { return currentId; }
 void appShowPhoto(uint16_t id) { openPhoto(id); }
 void appShowBusy(const char* msg) { showBusy(msg); }
 void appRedrawAll() { redrawAll(epd_mode_t::epd_fast); }
+void appNoteWebActivity() { lastActivityMs = lastWebMs = millis(); }
+void appWifiStateChanged() { infoStale = true; }
 M5Canvas& appComposeCanvas() { return composeCanvas; }
 
 void appPhotoDeleted(uint16_t id) {
@@ -637,19 +706,26 @@ void setup() {
     c->fillScreen(TFT_WHITE);
   }
 
-  showBusy("Wi-Fi 接続中…");
   web::begin();
-  Serial.printf("url: %s (%s)\n", web::url().c_str(), web::isAccessPoint() ? "AP" : "STA");
 
   uint16_t id = store::loadCurrentId();
   auto ids = store::list();
   if (std::find(ids.begin(), ids.end(), id) == ids.end()) id = ids.empty() ? 0 : ids.front();
   openPhoto(id);
   statusDueMs = millis() + 60000;
+  lastActivityMs = millis();
 }
 
 void loop() {
   M5.update();
+  if (wakeGuard) {
+    // 起こした操作で線を引いたり写真を送ったりしないよう、全部離されるまで入力を読み捨てる
+    bool held = M5.Touch.getCount() > 0 || M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnC.isPressed();
+    if (!held) wakeGuard = false;
+    lastActivityMs = millis();
+    web::loop();
+    return;
+  }
   handleTouch();
   flushPending();  // 指が止まっていても溜まった線を出す
   if (drawing) return;  // 描画中はタッチを最優先
@@ -657,11 +733,24 @@ void loop() {
 
   web::loop();
 
+  if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed()) lastActivityMs = millis();
   if (M5.BtnA.wasPressed()) stepPhoto(-1);
   if (M5.BtnC.wasPressed()) stepPhoto(1);
   if (M5.BtnB.wasPressed()) onToolbar(B_REFRESH);
 
   uint32_t now = millis();
+  if (infoStale) {
+    infoStale = false;
+    if (overlay == Overlay::Info) redrawAll(epd_mode_t::epd_fast);
+  }
+  if (web::state() != web::State::Off && overlay != Overlay::Info && now - lastWebMs >= kWifiOffAfterMs) {
+    web::stop();
+  }
+  uint32_t sleepAfter = overlay == Overlay::Info ? kSleepAfterInfoMs : kSleepAfterMs;
+  if (now - lastActivityMs >= sleepAfter) {
+    enterSleep();
+    return;
+  }
   if (saveDueMs && (int32_t)(now - saveDueMs) >= 0) saveNow();
   if ((int32_t)(now - statusDueMs) >= 0) {
     statusDueMs = now + 60000;

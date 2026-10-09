@@ -7,4 +7,6 @@ void appShowPhoto(uint16_t id);      // 現在のメモを保存してから切�
 void appPhotoDeleted(uint16_t id);
 void appShowBusy(const char* msg);   // 処理中メッセージ
 void appRedrawAll();
+void appNoteWebActivity();           // Wi-Fi オフ / スリープまでの時間をリセット
+void appWifiStateChanged();
 M5Canvas& appComposeCanvas();        // 現在の表示内容（元画像 + 表示中レイヤー）

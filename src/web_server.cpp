@@ -18,12 +18,17 @@ static const char* kApPass = "m5papermemo";
 static const char* kHostname = "m5paper";
 
 static WebServer server(80);
+static constexpr uint32_t kConnectTimeoutMs = 15000;
 static bool apMode = false;
+static State wifiState = State::Off;
+static uint32_t connectStartMs = 0;
+static String staSsid, staPass;
 static File uploadFile;
 static String uploadErr;
 
 bool isAccessPoint() { return apMode; }
-String ssid() { return apMode ? String(kApSsid) : WiFi.SSID(); }
+State state() { return wifiState; }
+String ssid() { return apMode ? String(kApSsid) : staSsid; }
 String apPassword() { return kApPass; }
 String url() { return "http://" + (apMode ? WiFi.softAPIP() : WiFi.localIP()).toString() + "/"; }
 
@@ -184,43 +189,98 @@ static void handleWifi() {
   ESP.restart();
 }
 
-static bool connectStation() {
+static void loadStationConfig() {
+  staSsid = staPass = "";
   File f = LittleFS.open(kWifiFile, FILE_READ);
-  if (!f) return false;
-  String s = f.readStringUntil('\n'), p = f.readStringUntil('\n');
+  if (!f) return;
+  staSsid = f.readStringUntil('\n');
+  staPass = f.readStringUntil('\n');
   f.close();
-  s.trim();
-  p.trim();
-  if (!s.length()) return false;
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(kHostname);
-  WiFi.begin(s.c_str(), p.c_str());
-  for (int i = 0; i < 150 && WiFi.status() != WL_CONNECTED; ++i) delay(100);
-  return WiFi.status() == WL_CONNECTED;
+  staSsid.trim();
+  staPass.trim();
+}
+
+static void startAccessPoint() {
+  apMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(kApSsid, kApPass);
+}
+
+static void setState(State s) {
+  wifiState = s;
+  appWifiStateChanged();
+}
+
+static void becomeReady() {
+  server.begin();
+  MDNS.begin(kHostname);
+  MDNS.addService("http", "tcp", 80);
+  setState(State::Ready);
 }
 
 void begin() {
-  apMode = !connectStation();
-  if (apMode) {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(kApSsid, kApPass);
-  }
-  MDNS.begin(kHostname);
-  MDNS.addService("http", "tcp", 80);
+  // 起動時は Wi-Fi を付けない。ルートだけ登録しておく
+  WiFi.mode(WIFI_OFF);
 
-  server.on("/", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", kIndexHtml); });
-  server.on("/api/list", HTTP_GET, handleList);
-  server.on("/api/thumb", HTTP_GET, handleThumb);
-  server.on("/api/snapshot.bmp", HTTP_GET, handleSnapshot);
-  server.on("/api/upload", HTTP_POST, handleUploadDone, handleUploadData);
-  server.on("/api/show", HTTP_POST, handleShow);
-  server.on("/api/delete", HTTP_POST, handleDelete);
-  server.on("/api/wifi", HTTP_POST, handleWifi);
+  // iPhone からの操作中に Wi-Fi やスリープが切れないよう、どのリクエストでも時間をリセットする
+  auto on = [](const char* path, HTTPMethod method, WebServer::THandlerFunction fn) {
+    server.on(path, method, [fn] {
+      appNoteWebActivity();
+      fn();
+    });
+  };
+  on("/", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", kIndexHtml); });
+  on("/api/list", HTTP_GET, handleList);
+  on("/api/thumb", HTTP_GET, handleThumb);
+  on("/api/snapshot.bmp", HTTP_GET, handleSnapshot);
+  server.on("/api/upload", HTTP_POST, handleUploadDone, [] {
+    appNoteWebActivity();
+    handleUploadData();
+  });
+  on("/api/show", HTTP_POST, handleShow);
+  on("/api/delete", HTTP_POST, handleDelete);
+  on("/api/wifi", HTTP_POST, handleWifi);
   server.onNotFound([] { server.send(404, "text/plain", "not found"); });
-  server.begin();
 }
 
-void loop() { server.handleClient(); }
+void start() {
+  if (wifiState != State::Off) return;
+  loadStationConfig();
+  if (staSsid.length()) {
+    // 家の Wi-Fi へ。接続は待たずに戻り、loop() で完了 / タイムアウトを見る
+    apMode = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(kHostname);
+    WiFi.begin(staSsid.c_str(), staPass.c_str());
+    connectStartMs = millis();
+    setState(State::Connecting);
+  } else {
+    startAccessPoint();
+    becomeReady();
+  }
+}
+
+void stop() {
+  if (wifiState == State::Off) return;
+  server.stop();
+  MDNS.end();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  setState(State::Off);
+}
+
+void loop() {
+  if (wifiState == State::Connecting) {
+    if (WiFi.status() == WL_CONNECTED) {
+      becomeReady();
+    } else if (millis() - connectStartMs > kConnectTimeoutMs) {
+      // 家の Wi-Fi が見つからなければアクセスポイントとして待つ
+      WiFi.disconnect(true);
+      startAccessPoint();
+      becomeReady();
+    }
+  }
+  if (wifiState == State::Ready) server.handleClient();
+}
 
 }  // namespace web

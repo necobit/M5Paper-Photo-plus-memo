@@ -65,9 +65,9 @@ constexpr uint32_t kRefreshIdleMs = 800;
 
 // 操作が無いと 2 段階で省電力（時間は settings で変更可。どちらも最後の操作から数える）
 //   1. ライトスリープ: RAM の状態を保持。タッチか側面スイッチで即復帰
-//   2. 電源オフ: 状態は Flash に保存済み。ボタンで起動し、画面は残っているので描き直さずに再開
+//   2. 電源オフ: 状態は Flash に保存済み。電源ボタン(G38)長押しで起動し、同じ画面から再開
 constexpr uint32_t kSleepAfterInfoMs = 180000;  // 「送る」画面を表示中は iPhone 操作を待つので長め
-constexpr const char* kResumeFlag = "/resume.flag";  // 電源オフ時の画面がそのまま残っている印
+constexpr const char* kResumeFlag = "/resume.flag";  // 電源オフからの起動の印
 constexpr gpio_num_t kButtonPins[] = {GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39};  // 側面スイッチ 上/押し/下
 uint32_t lastActivityMs = 0;
 
@@ -184,7 +184,7 @@ void drawButton(int i) {
       }
       if (powerState == PowerState::Off) {
         drawLabel("電源オフ", cx, y + 18, fontS, fg, bg);
-        drawLabel("押して起動", cx, y + 42, fontS, fg, bg);
+        drawLabel("長押し起動", cx, y + 42, fontS, fg, bg);  // 電源ボタン(G38)の長押し
         break;
       }
       auto ids = store::list();
@@ -406,7 +406,7 @@ void saveNow() {
 
 void scheduleSave() { saveDueMs = millis() + kSaveDelayMs; }
 
-void openPhoto(uint16_t id, bool redraw = true) {
+void openPhoto(uint16_t id) {
   saveNow();
   overlay = Overlay::None;
   confirmDeleteIndex = -1;
@@ -419,9 +419,8 @@ void openPhoto(uint16_t id, bool redraw = true) {
     doc.reset();
     overlay = Overlay::Info;
     startWifi();
-    redraw = true;
   }
-  if (redraw) redrawAll();
+  redrawAll();
 }
 
 void stepPhoto(int dir) {
@@ -746,7 +745,7 @@ void powerOff() {
   Serial.println("power off");
   M5.Display.wakeup();
   if (overlay != Overlay::None) {
-    overlay = Overlay::None;  // 起動時に描き直さず再開できるよう、写真だけの画面にしておく
+    overlay = Overlay::None;  // 電源オフ中に見える画面は写真だけにしておく
     confirmDeleteIndex = -1;
     redrawAll();
   } else {
@@ -850,7 +849,8 @@ void setup() {
   settings::load();
   tool = settings::get().tool ? Tool::Eraser : Tool::Pen;
   widthIdx = settings::get().widthIdx % sizeof(kPenWidths);
-  // 電源オフ前の画面が残っていれば描き直さない（約 1 秒短縮、画面もちらつかない）
+  // 電源オフからの再開。画面は残っているので「起動中」表示は出さない。
+  // ただし IT8951 は電源断で表示状態を忘れており、部分更新すると掠れるため全面を描き直す
   bool resumed = LittleFS.exists(kResumeFlag);
   LittleFS.remove(kResumeFlag);
   if (!resumed) showBusy("起動中…");
@@ -867,14 +867,7 @@ void setup() {
   uint16_t id = store::loadCurrentId();
   auto ids = store::list();
   if (std::find(ids.begin(), ids.end(), id) == ids.end()) id = ids.empty() ? 0 : ids.front();
-  openPhoto(id, !resumed || id != store::loadCurrentId());
-  if (resumed) {
-    M5.Display.setEpdMode(epd_mode_t::epd_fast);
-    M5.Display.startWrite();
-    drawButton(B_STATUS);  // 「電源オフ」表示を戻す
-    drawButton(B_UNDO);    // Undo 履歴は電源オフで消えるので無効表示に
-    M5.Display.endWrite();
-  }
+  openPhoto(id);
   Serial.printf("ready %lu ms%s\n", millis(), resumed ? " (resumed)" : "");
   statusDueMs = millis() + 60000;
   lastActivityMs = millis();

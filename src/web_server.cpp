@@ -7,7 +7,6 @@
 #include "app.h"
 #include "memo_doc.h"
 #include "photo_store.h"
-#include "settings.h"
 #include "web_page.h"
 
 namespace web {
@@ -108,17 +107,8 @@ static void handleList() {
     if (i) json += ',';
     json += ids[i];
   }
-  auto& st = settings::get();
-  json += "],\"sleep\":" + String(st.sleepSec) + ",\"poweroff\":" + String(st.powerOffSec) + "}";
+  json += "]}";
   server.send(200, "application/json", json);
-}
-
-static void handleSettings() {
-  auto& st = settings::get();
-  if (server.hasArg("sleep")) st.sleepSec = std::max(10L, server.arg("sleep").toInt());
-  if (server.hasArg("poweroff")) st.powerOffSec = std::max(0L, server.arg("poweroff").toInt());
-  settings::save();
-  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 static void handleUploadData() {
@@ -250,7 +240,6 @@ void begin() {
   on("/api/show", HTTP_POST, handleShow);
   on("/api/delete", HTTP_POST, handleDelete);
   on("/api/wifi", HTTP_POST, handleWifi);
-  on("/api/settings", HTTP_POST, handleSettings);
   server.onNotFound([] { server.send(404, "text/plain", "not found"); });
 }
 

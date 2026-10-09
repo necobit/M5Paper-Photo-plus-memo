@@ -26,9 +26,17 @@ constexpr uint8_t kPenWidths[] = {2, 5, 10};
 constexpr int kEraserRadius = 14;
 constexpr uint32_t kSaveDelayMs = 3000;
 
+// 設定パネルの選択肢（秒）
+constexpr uint32_t kSleepChoices[] = {15, 30, 60, 120, 300};
+const char* const kSleepLabels[] = {"15秒", "30秒", "1分", "2分", "5分"};
+constexpr uint32_t kOffChoices[] = {300, 600, 1800, 3600, 0};
+const char* const kOffLabels[] = {"5分", "10分", "30分", "1時間", "しない"};
+constexpr int kChoiceCount = 5;
+constexpr int CHOICE_W = PANEL_W / kChoiceCount;
+
 enum Btn { B_TOOL, B_WIDTH, B_LAYER, B_UNDO, B_PREV, B_NEXT, B_REFRESH, B_WIFI, B_STATUS, BTN_COUNT };
 enum class Tool { Pen, Eraser };
-enum class Overlay { None, Layers, Info };
+enum class Overlay { None, Layers, Info, Settings };
 
 M5Canvas baseCanvas(&M5.Display);     // 元画像
 M5Canvas composeCanvas(&M5.Display);  // 元画像 + 表示中レイヤー
@@ -142,7 +150,7 @@ void drawButton(int i) {
   auto& d = M5.Display;
   int y = i * BTN_H, cx = TB_X + TB_W / 2, cy = y + BTN_H / 2;
   bool inv = (i == B_TOOL && tool == Tool::Eraser) || (i == B_LAYER && overlay == Overlay::Layers) ||
-             (i == B_WIFI && overlay == Overlay::Info);
+             (i == B_WIFI && overlay == Overlay::Info) || (i == B_STATUS && overlay == Overlay::Settings);
   uint16_t bg = inv ? TFT_BLACK : TFT_WHITE, fg = inv ? TFT_WHITE : TFT_BLACK;
   d.fillRect(TB_X, y, TB_W, BTN_H, bg);
   d.drawFastHLine(TB_X, y + BTN_H - 1, TB_W, TFT_DARKGREY);
@@ -183,9 +191,10 @@ void drawButton(int i) {
       int pos = std::find(ids.begin(), ids.end(), currentId) - ids.begin();
       if (currentId && pos < (int)ids.size()) snprintf(buf, sizeof(buf), "%d/%d", pos + 1, (int)ids.size());
       else snprintf(buf, sizeof(buf), "-/%d", (int)ids.size());
-      drawLabel(buf, cx, y + 18, fontS, fg, bg);
+      drawLabel(buf, cx, y + 12, fontS, fg, bg);
       snprintf(buf, sizeof(buf), "%d%%", (int)M5.Power.getBatteryLevel());
-      drawLabel(buf, cx, y + 42, fontS, TFT_DARKGREY, bg);
+      drawLabel(buf, cx, y + 30, fontS, inv ? TFT_LIGHTGREY : TFT_DARKGREY, bg);
+      drawLabel("設定", cx, y + 48, fontS, fg, bg);  // タップで設定パネル
       break;
     }
   }
@@ -250,6 +259,54 @@ void drawPanel() {
   drawLabel("+ レイヤー追加", PANEL_X + 100, y + ROW_H / 2, fontS, canAdd ? TFT_BLACK : TFT_LIGHTGREY, TFT_WHITE);
   d.drawFastVLine(COL_VIS, y, ROW_H, TFT_DARKGREY);
   drawLabel("閉じる", COL_VIS + 100, y + ROW_H / 2, fontL, TFT_BLACK, TFT_WHITE);
+}
+
+void drawSettingsPanel() {
+  auto& d = M5.Display;
+  auto& st = settings::get();
+  d.fillRect(PANEL_X, 0, PANEL_W, IMG_H, TFT_WHITE);
+  d.fillRect(PANEL_X, 0, 3, IMG_H, TFT_BLACK);
+  drawLabel("設定", PANEL_X + 40, ROW_H / 2, fontL, TFT_BLACK, TFT_WHITE);
+  drawLabel("どちらも最後の操作から", PANEL_X + 250, ROW_H / 2, fontS, TFT_DARKGREY, TFT_WHITE);
+
+  auto choiceRow = [&](int row, const char* title, const uint32_t* values, const char* const* labels,
+                       uint32_t current) {
+    int y = row * ROW_H;
+    d.drawFastHLine(PANEL_X, y, PANEL_W, TFT_DARKGREY);
+    d.setFont(fontS);
+    d.setTextDatum(textdatum_t::middle_left);
+    d.setTextColor(TFT_BLACK, TFT_WHITE);
+    d.drawString(title, PANEL_X + 16, y + ROW_H / 2);
+    y += ROW_H;
+    for (int i = 0; i < kChoiceCount; ++i) {
+      int x = PANEL_X + i * CHOICE_W;
+      bool sel = values[i] == current;
+      if (sel) d.fillRoundRect(x + 6, y + 8, CHOICE_W - 12, ROW_H - 16, 6, TFT_BLACK);
+      else d.drawRoundRect(x + 6, y + 8, CHOICE_W - 12, ROW_H - 16, 6, TFT_BLACK);
+      drawLabel(labels[i], x + CHOICE_W / 2, y + ROW_H / 2, fontS, sel ? TFT_WHITE : TFT_BLACK,
+                sel ? TFT_BLACK : TFT_WHITE);
+    }
+  };
+  choiceRow(1, "スリープまで（タッチで復帰）", kSleepChoices, kSleepLabels, st.sleepSec);
+  choiceRow(3, "電源オフまで（ボタンで起動）", kOffChoices, kOffLabels, st.powerOffSec);
+
+  int y = 5 * ROW_H;
+  d.drawFastHLine(PANEL_X, y, PANEL_W, TFT_DARKGREY);
+  d.setFont(fontS);
+  d.setTextDatum(textdatum_t::top_left);
+  d.setTextColor(TFT_DARKGREY, TFT_WHITE);
+  d.drawString("電源オフ中も画面は表示されたまま。", PANEL_X + 16, y + 16);
+  d.drawString("起動すると約2秒で続きから書ける。", PANEL_X + 16, y + 40);
+  d.drawString("Wi-Fi は「送る」を押した時だけ付く。", PANEL_X + 16, y + 64);
+
+  y = PANEL_LAST_ROW * ROW_H;
+  d.drawFastHLine(PANEL_X, y, PANEL_W, TFT_BLACK);
+  drawLabel("閉じる", PANEL_X + PANEL_W / 2, y + ROW_H / 2, fontL, TFT_BLACK, TFT_WHITE);
+}
+
+void drawOverlayPanel() {
+  if (overlay == Overlay::Layers) drawPanel();
+  else if (overlay == Overlay::Settings) drawSettingsPanel();
 }
 
 void drawInfo() {
@@ -317,7 +374,7 @@ void redrawAll(epd_mode_t mode = epd_mode_t::epd_quality) {
     drawInfo();
   } else {
     composeCanvas.pushSprite(&M5.Display, 0, 0);
-    if (overlay == Overlay::Layers) drawPanel();
+    drawOverlayPanel();
   }
   drawToolbar();
   M5.Display.endWrite();
@@ -378,7 +435,8 @@ void stepPhoto(int dir) {
 // ---------------------------------------------------------------- 入力
 
 void closeOverlayAndRedraw() {
-  overlay = Overlay::None;
+  overlay = currentId ? Overlay::None : Overlay::Info;  // 写真が無ければ「送る」画面に戻る
+  if (overlay == Overlay::Info) startWifi();
   confirmDeleteIndex = -1;
   redrawAll();
 }
@@ -439,6 +497,42 @@ void onPanelTap(int x, int y) {
   }
 }
 
+// 右側のパネル（レイヤー / 設定）を開く。パネル同士の切り替えは描き足すだけで済ませる
+void openPanel(Overlay o) {
+  bool wasInfo = overlay == Overlay::Info;
+  overlay = o;
+  confirmDeleteIndex = -1;
+  if (wasInfo) {
+    redrawAll(epd_mode_t::epd_fast);
+    return;
+  }
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
+  M5.Display.startWrite();
+  drawOverlayPanel();
+  drawButton(B_LAYER);
+  drawButton(B_STATUS);
+  M5.Display.endWrite();
+}
+
+void onSettingsTap(int x, int y) {
+  int row = y / ROW_H;
+  int i = std::min((x - PANEL_X) / CHOICE_W, kChoiceCount - 1);
+  auto& st = settings::get();
+  if (row == 2) st.sleepSec = kSleepChoices[i];
+  else if (row == 4) st.powerOffSec = kOffChoices[i];
+  else if (row == PANEL_LAST_ROW) {
+    closeOverlayAndRedraw();
+    return;
+  } else {
+    return;
+  }
+  settings::save();
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
+  M5.Display.startWrite();
+  drawSettingsPanel();
+  M5.Display.endWrite();
+}
+
 void onToolbar(int i) {
   switch (i) {
     case B_TOOL:
@@ -458,13 +552,7 @@ void onToolbar(int i) {
       if (overlay == Overlay::Layers) {
         closeOverlayAndRedraw();
       } else {
-        overlay = Overlay::Layers;
-        confirmDeleteIndex = -1;
-        M5.Display.setEpdMode(epd_mode_t::epd_fast);
-        M5.Display.startWrite();
-        drawPanel();
-        drawButton(B_LAYER);
-        M5.Display.endWrite();
+        openPanel(Overlay::Layers);
       }
       break;
     case B_UNDO: {
@@ -476,7 +564,7 @@ void onToolbar(int i) {
       M5.Display.setEpdMode(epd_mode_t::epd_quality);
       M5.Display.startWrite();
       pushImage(r);
-      if (overlay == Overlay::Layers) drawPanel();
+      drawOverlayPanel();
       drawButton(B_UNDO);
       M5.Display.endWrite();
       break;
@@ -487,6 +575,10 @@ void onToolbar(int i) {
       M5.Display.setEpdMode(epd_mode_t::epd_quality);
       M5.Display.clear(TFT_WHITE);  // 残像を消すため一度白で塗る
       redrawAll();
+      break;
+    case B_STATUS:
+      if (overlay == Overlay::Settings) closeOverlayAndRedraw();
+      else openPanel(Overlay::Settings);
       break;
     case B_WIFI:
       if (overlay == Overlay::Info) {
@@ -525,7 +617,8 @@ void refreshWhenIdle() {
   if (drawing || (pendingRefresh.empty() && !undoButtonStale)) return;
   if ((int32_t)(millis() - refreshDueMs) < 0) return;
   if (!pendingSegs.empty() || !pendingErase.empty() || M5.Display.displayBusy()) return;
-  Rect r = pendingRefresh.clipped(overlay == Overlay::Layers ? PANEL_X : IMG_W, IMG_H);
+  bool panel = overlay == Overlay::Layers || overlay == Overlay::Settings;
+  Rect r = pendingRefresh.clipped(panel ? PANEL_X : IMG_W, IMG_H);
   M5.Display.setEpdMode(epd_mode_t::epd_text);
   M5.Display.startWrite();
   if (!r.empty() && overlay != Overlay::Info) {
@@ -628,6 +721,9 @@ void handleTouch() {
       scheduleSave();
       closeOverlayAndRedraw();
     }
+  } else if (overlay == Overlay::Settings) {
+    if (x >= PANEL_X) onSettingsTap(x, y);
+    else closeOverlayAndRedraw();
   } else if (overlay == Overlay::Info) {
     if (currentId) closeOverlayAndRedraw();
   } else if (currentId) {
@@ -638,7 +734,7 @@ void handleTouch() {
 // 表示待ちを出し切り、高速更新で荒れた部分も整える
 void settleDisplay() {
   Rect r = takePending();
-  if (overlay == Overlay::Layers) r = r.clipped(PANEL_X, IMG_H);
+  if (overlay == Overlay::Layers || overlay == Overlay::Settings) r = r.clipped(PANEL_X, IMG_H);
   if (overlay != Overlay::Info && !r.empty()) {
     M5.Display.setEpdMode(epd_mode_t::epd_text);
     pushImage(r);

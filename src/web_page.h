@@ -48,21 +48,6 @@ select,input[type=text],input[type=password]{width:100%;font-size:16px;padding:1
 </section>
 
 <section>
-<h2>省電力</h2>
-<p class="muted">最後の操作から数えます。スリープ中はタッチですぐ戻り、電源オフ後は本体のボタンで起動します（画面は表示されたまま）。</p>
-<label class="muted">スリープまで</label>
-<select id="sleep">
-<option value="15">15 秒</option><option value="30">30 秒</option><option value="60">1 分</option>
-<option value="120">2 分</option><option value="300">5 分</option>
-</select>
-<label class="muted">電源オフまで</label>
-<select id="poweroff">
-<option value="300">5 分</option><option value="600">10 分</option><option value="1800">30 分</option>
-<option value="3600">1 時間</option><option value="0">切らない</option>
-</select>
-</section>
-
-<section>
 <h2>Wi-Fi 設定</h2>
 <p class="muted">家の Wi-Fi に接続すると、iPhone を Wi-Fi に繋いだまま送れます。空欄で保存するとアクセスポイントモードに戻ります。</p>
 <form method="post" action="/api/wifi">
@@ -135,21 +120,8 @@ $('#file').addEventListener('change',async e=>{
   refresh();
 });
 
-function pickOption(sel,v){
-  if(![...sel.options].some(o=>o.value==v)){const o=new Option(v+' 秒',v);sel.add(o);}
-  sel.value=v;
-}
-for(const id of ['sleep','poweroff']){
-  $('#'+id).addEventListener('change',async e=>{
-    try{await post('/api/settings?'+id+'='+e.target.value);status('設定を保存しました');}
-    catch(err){status('設定の保存に失敗: '+err.message);}
-  });
-}
-
 async function refresh(){
   const j=await (await fetch('/api/list')).json();
-  pickOption($('#sleep'),j.sleep);
-  pickOption($('#poweroff'),j.poweroff);
   const list=$('#list');
   list.innerHTML='';
   if(!j.photos.length)list.innerHTML='<p class="muted">まだ写真がありません</p>';

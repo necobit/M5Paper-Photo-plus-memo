@@ -60,7 +60,7 @@ struct Seg {
 };
 std::vector<Seg> pendingSegs;  // まだ画面に描いていないペンの線分
 Rect pendingErase;             // 消しゴムで消えたがまだ画面に反映していない範囲
-Rect pendingRefresh;           // 書き終えた範囲。手が止まったら階調を整えて描き直す
+Rect pendingRefresh;           // 消しゴムで 2 値表示になった範囲。手が止まったら階調付きで描き直す
 uint32_t refreshDueMs = 0;
 bool undoButtonStale = false;
 constexpr uint32_t kRefreshIdleMs = 800;
@@ -628,7 +628,7 @@ void flushPending() {
   pendingErase = Rect();
 }
 
-// 書くのを 0.8 秒休んだら、高速更新で荒れた範囲を階調付きで描き直す
+// 消しゴムを 0.8 秒休んだら、高速更新で荒れた写真の階調を描き直す
 void refreshWhenIdle() {
   if (drawing || (pendingRefresh.empty() && !undoButtonStale)) return;
   if ((int32_t)(millis() - refreshDueMs) < 0) return;
@@ -709,8 +709,8 @@ void endStroke() {
   drawing = false;
   bool hadUndo = !doc.undoStack.empty();
   if (tool == Tool::Pen || tool == Tool::Stamp) {
+    // 線は溜めて空いた時に描く方式で掠れなくなったので、描き直しはしない
     doc.commitStroke(std::move(curStroke));
-    pendingRefresh.unite(doc.strokes.back().bounds);
   } else {
     doc.endErase();
   }

@@ -12,6 +12,7 @@
 #include "app.h"
 #include "memo_doc.h"
 #include "photo_store.h"
+#include "settings.h"
 #include "web_server.h"
 
 namespace {
@@ -54,9 +55,11 @@ uint32_t refreshDueMs = 0;
 bool undoButtonStale = false;
 constexpr uint32_t kRefreshIdleMs = 800;
 
-// 操作が無いとライトスリープ（RAM の状態は保持、e-ink は表示を保持）。タッチか側面スイッチで復帰
-constexpr uint32_t kSleepAfterMs = 30000;
+// 操作が無いと 2 段階で省電力（時間は settings で変更可。どちらも最後の操作から数える）
+//   1. ライトスリープ: RAM の状態を保持。タッチか側面スイッチで即復帰
+//   2. 電源オフ: 状態は Flash に保存済み。ボタンで起動し、画面は残っているので描き直さずに再開
 constexpr uint32_t kSleepAfterInfoMs = 180000;  // 「送る」画面を表示中は iPhone 操作を待つので長め
+constexpr const char* kResumeFlag = "/resume.flag";  // 電源オフ時の画面がそのまま残っている印
 constexpr gpio_num_t kButtonPins[] = {GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39};  // 側面スイッチ 上/押し/下
 uint32_t lastActivityMs = 0;
 
@@ -64,7 +67,8 @@ uint32_t lastActivityMs = 0;
 constexpr uint32_t kWifiOffAfterMs = 60000;
 uint32_t lastWebMs = 0;
 bool infoStale = false;  // Wi-Fi の状態が変わり「送る」画面の描き直しが必要
-bool sleeping = false;
+enum class PowerState { Awake, Sleeping, Off };
+PowerState powerState = PowerState::Awake;
 bool wakeGuard = false;  // 起こしたタッチ / スイッチ操作を離すまで無視する
 uint32_t saveDueMs = 0;
 uint32_t statusDueMs = 0;
@@ -165,9 +169,14 @@ void drawButton(int i) {
     case B_REFRESH: drawLabel("更新", cx, cy, fontL, fg, bg); break;
     case B_WIFI: drawLabel("送る", cx, cy, fontL, fg, bg); break;
     case B_STATUS: {
-      if (sleeping) {
+      if (powerState == PowerState::Sleeping) {
         drawLabel("スリープ", cx, y + 18, fontS, fg, bg);
         drawLabel("中", cx, y + 42, fontS, fg, bg);  // 幅 80px に収まる表記
+        break;
+      }
+      if (powerState == PowerState::Off) {
+        drawLabel("電源オフ", cx, y + 18, fontS, fg, bg);
+        drawLabel("押して起動", cx, y + 42, fontS, fg, bg);
         break;
       }
       auto ids = store::list();
@@ -189,7 +198,10 @@ void drawToolbar() {
 
 void updateButton(int i) {
   M5.Display.setEpdMode(epd_mode_t::epd_fast);
+  // まとめて 1 回の画面更新にする（図形ごとに更新すると前の更新完了を何度も待つ）
+  M5.Display.startWrite();
   drawButton(i);
+  M5.Display.endWrite();
 }
 
 void drawPanel() {
@@ -337,7 +349,7 @@ void saveNow() {
 
 void scheduleSave() { saveDueMs = millis() + kSaveDelayMs; }
 
-void openPhoto(uint16_t id) {
+void openPhoto(uint16_t id, bool redraw = true) {
   saveNow();
   overlay = Overlay::None;
   confirmDeleteIndex = -1;
@@ -350,8 +362,9 @@ void openPhoto(uint16_t id) {
     doc.reset();
     overlay = Overlay::Info;
     startWifi();
+    redraw = true;
   }
-  redrawAll();
+  if (redraw) redrawAll();
 }
 
 void stepPhoto(int dir) {
@@ -622,17 +635,50 @@ void handleTouch() {
   }
 }
 
-void enterSleep() {
-  // 表示待ちを出し切り、高速更新で荒れた部分も整えてから眠る
+// 表示待ちを出し切り、高速更新で荒れた部分も整える
+void settleDisplay() {
   Rect r = takePending();
   if (overlay == Overlay::Layers) r = r.clipped(PANEL_X, IMG_H);
   if (overlay != Overlay::Info && !r.empty()) {
     M5.Display.setEpdMode(epd_mode_t::epd_text);
     pushImage(r);
   }
-  saveNow();
-  sleeping = true;
   M5.Display.waitDisplay();
+}
+
+void powerOff() {
+  Serial.println("power off");
+  M5.Display.wakeup();
+  if (overlay != Overlay::None) {
+    overlay = Overlay::None;  // 起動時に描き直さず再開できるよう、写真だけの画面にしておく
+    confirmDeleteIndex = -1;
+    redrawAll();
+  } else {
+    settleDisplay();
+  }
+  saveNow();
+  auto& st = settings::get();
+  st.tool = (uint8_t)tool;
+  st.widthIdx = widthIdx;
+  settings::save();
+  File f = LittleFS.open(kResumeFlag, FILE_WRITE);
+  if (f) f.close();
+
+  powerState = PowerState::Off;
+  updateButton(B_STATUS);
+  M5.Display.waitDisplay();
+  web::stop();
+  Serial.flush();
+  // バッテリー駆動なら電源が落ちる。USB 給電中は落ちずにディープスリープになるので、押し込みで起こす
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_38, 0);
+  M5.Power.powerOff();
+}
+
+// ライトスリープ。remainMs 後に起きなければ（タイマーで起きたら）電源オフへ進む
+void enterSleep(uint32_t remainMs) {
+  settleDisplay();
+  saveNow();
+  powerState = PowerState::Sleeping;
   updateButton(B_STATUS);
   M5.Display.waitDisplay();
   Serial.println("sleep");
@@ -642,12 +688,19 @@ void enterSleep() {
   M5.Display.sleep();
   for (auto pin : kButtonPins) gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
-  M5.Power.lightSleep(m5::Power_Class::sleep_no_timer, true);  // タッチ INT(GPIO36) でも復帰
+  // タッチ INT(GPIO36) でも復帰
+  M5.Power.lightSleep(remainMs ? (uint64_t)remainMs * 1000 : m5::Power_Class::sleep_no_timer, true);
   for (auto pin : kButtonPins) gpio_wakeup_disable(pin);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
 
-  Serial.printf("wakeup cause=%d\n", (int)esp_sleep_get_wakeup_cause());
+  auto cause = esp_sleep_get_wakeup_cause();
+  Serial.printf("wakeup cause=%d\n", (int)cause);
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    powerOff();
+    return;
+  }
   M5.Display.wakeup();
-  sleeping = false;
+  powerState = PowerState::Awake;
   wakeGuard = true;
   if (overlay == Overlay::Info) startWifi();  // 「送る」画面のまま眠った場合は Wi-Fi を付け直す
   updateButton(B_STATUS);
@@ -695,10 +748,16 @@ void setup() {
   cfg.serial_baudrate = 115200;
   M5.begin(cfg);
   if (M5.Display.width() < M5.Display.height()) M5.Display.setRotation(M5.Display.getRotation() ^ 1);
-  Serial.printf("display %dx%d\n", M5.Display.width(), M5.Display.height());
+  Serial.printf("M5.begin done %lu ms\n", millis());
 
-  showBusy("起動中…");
   if (!store::begin()) fatal("ストレージを初期化できません");
+  settings::load();
+  tool = settings::get().tool ? Tool::Eraser : Tool::Pen;
+  widthIdx = settings::get().widthIdx % sizeof(kPenWidths);
+  // 電源オフ前の画面が残っていれば描き直さない（約 1 秒短縮、画面もちらつかない）
+  bool resumed = LittleFS.exists(kResumeFlag);
+  LittleFS.remove(kResumeFlag);
+  if (!resumed) showBusy("起動中…");
 
   for (auto* c : {&baseCanvas, &composeCanvas}) {
     c->setPsram(true);
@@ -712,7 +771,15 @@ void setup() {
   uint16_t id = store::loadCurrentId();
   auto ids = store::list();
   if (std::find(ids.begin(), ids.end(), id) == ids.end()) id = ids.empty() ? 0 : ids.front();
-  openPhoto(id);
+  openPhoto(id, !resumed || id != store::loadCurrentId());
+  if (resumed) {
+    M5.Display.setEpdMode(epd_mode_t::epd_fast);
+    M5.Display.startWrite();
+    drawButton(B_STATUS);  // 「電源オフ」表示を戻す
+    drawButton(B_UNDO);    // Undo 履歴は電源オフで消えるので無効表示に
+    M5.Display.endWrite();
+  }
+  Serial.printf("ready %lu ms%s\n", millis(), resumed ? " (resumed)" : "");
   statusDueMs = millis() + 60000;
   lastActivityMs = millis();
 }
@@ -747,9 +814,17 @@ void loop() {
   if (web::state() != web::State::Off && overlay != Overlay::Info && now - lastWebMs >= kWifiOffAfterMs) {
     web::stop();
   }
-  uint32_t sleepAfter = overlay == Overlay::Info ? kSleepAfterInfoMs : kSleepAfterMs;
-  if (now - lastActivityMs >= sleepAfter) {
-    enterSleep();
+  auto& st = settings::get();
+  uint32_t idle = now - lastActivityMs;
+  uint32_t sleepAfter = st.sleepSec * 1000;
+  if (overlay == Overlay::Info) sleepAfter = std::max(sleepAfter, kSleepAfterInfoMs);
+  uint32_t offAfter = st.powerOffSec * 1000;
+  if (offAfter && idle >= offAfter) {
+    powerOff();
+    return;
+  }
+  if (idle >= sleepAfter) {
+    enterSleep(offAfter ? offAfter - idle : 0);
     return;
   }
   if (saveDueMs && (int32_t)(now - saveDueMs) >= 0) saveNow();

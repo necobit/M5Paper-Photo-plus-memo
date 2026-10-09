@@ -691,7 +691,8 @@ void appPhotoDeleted(uint16_t id) {
 
 void setup() {
   auto cfg = M5.config();
-  cfg.clear_display = true;
+  cfg.clear_display = false;  // 全面クリアは約1.4秒かかる。直後に写真を描き直すので不要
+  cfg.serial_baudrate = 115200;
   M5.begin(cfg);
   if (M5.Display.width() < M5.Display.height()) M5.Display.setRotation(M5.Display.getRotation() ^ 1);
   Serial.printf("display %dx%d\n", M5.Display.width(), M5.Display.height());

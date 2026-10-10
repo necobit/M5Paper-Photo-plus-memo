@@ -7,8 +7,9 @@
 constexpr int IMG_W = 880;  // 画像領域（右 80px はツールバー）
 constexpr int IMG_H = 540;
 constexpr int MAX_MEMO_LAYERS = 6;
+constexpr int SUB = 4;  // ストロークの座標・太さは 1/4 px 単位（拡大中に書いた線をなめらかに保つ）
 
-struct Point {
+struct Point {  // 元画像座標 x SUB
   int16_t x, y;
 };
 
@@ -25,12 +26,12 @@ struct Rect {
 
 struct Stroke {
   uint8_t layerId = 0;
-  uint8_t width = 3;
+  uint8_t width = 12;  // SUB 単位（最大 63.75px）
   bool deleted = false;
   std::vector<Point> pts;
-  Rect bounds;  // 線幅込みの外接矩形
+  Rect bounds;  // 線幅込みの外接矩形（元画像 px）
   void updateBounds();
-  bool hitTest(int px, int py, int radius) const;
+  bool hitTest(int px, int py, int radius) const;  // 引数は元画像 px
 };
 
 struct Layer {
@@ -63,7 +64,7 @@ class MemoDoc {
   Rect removeLayer(int index);   // 再描画が必要な範囲を返す
   void commitStroke(Stroke&& s);
   void beginErase();
-  Rect eraseAt(int x, int y, int radius);  // 消したストロークの範囲を返す
+  Rect eraseAt(int x, int y, int radius);  // 元画像 px。消したストロークの範囲を返す
   void endErase();
   Rect undo();
   int visibleStrokeCount(uint8_t layerId) const;

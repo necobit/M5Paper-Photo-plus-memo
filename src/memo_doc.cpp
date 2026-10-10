@@ -3,7 +3,7 @@
 #include <algorithm>
 
 static const uint8_t kMagic[4] = {'M', '5', 'P', 'M'};
-static constexpr uint8_t kVersion = 1;
+static constexpr uint8_t kVersion = 2;  // v1: 座標・太さが px 単位
 
 void Rect::unite(const Rect& o) {
   if (o.empty()) return;
@@ -42,11 +42,11 @@ void Stroke::updateBounds() {
     x2 = std::max(x2, p.x);
     y2 = std::max(y2, p.y);
   }
-  int m = width / 2 + 2;
-  bounds.x = x1 - m;
-  bounds.y = y1 - m;
-  bounds.w = x2 - x1 + m * 2 + 1;
-  bounds.h = y2 - y1 + m * 2 + 1;
+  int m = width / SUB / 2 + 2;
+  bounds.x = x1 / SUB - m;
+  bounds.y = y1 / SUB - m;
+  bounds.w = (x2 - x1) / SUB + m * 2 + 2;
+  bounds.h = (y2 - y1) / SUB + m * 2 + 2;
 }
 
 static int distSqToSegment(int px, int py, const Point& a, const Point& b) {
@@ -63,11 +63,12 @@ bool Stroke::hitTest(int px, int py, int radius) const {
   probe.y = py - radius;
   probe.w = probe.h = radius * 2 + 1;
   if (!bounds.intersects(probe)) return false;
-  int r = radius + width / 2;
+  int sx = px * SUB, sy = py * SUB;
+  int r = radius * SUB + width / 2;
   int r2 = r * r;
-  if (pts.size() == 1) return distSqToSegment(px, py, pts[0], pts[0]) <= r2;
+  if (pts.size() == 1) return distSqToSegment(sx, sy, pts[0], pts[0]) <= r2;
   for (size_t i = 1; i < pts.size(); ++i) {
-    if (distSqToSegment(px, py, pts[i - 1], pts[i]) <= r2) return true;
+    if (distSqToSegment(sx, sy, pts[i - 1], pts[i]) <= r2) return true;
   }
   return false;
 }
@@ -215,8 +216,8 @@ bool MemoDoc::load(fs::FS& fs, const char* path) {
   File f = fs.open(path, FILE_READ);
   if (!f) return false;
   uint8_t magic[4], hdr[4];
-  if (f.read(magic, 4) != 4 || memcmp(magic, kMagic, 4) != 0 || f.read(hdr, 4) != 4 || hdr[0] != kVersion ||
-      hdr[3] == 0) {
+  if (f.read(magic, 4) != 4 || memcmp(magic, kMagic, 4) != 0 || f.read(hdr, 4) != 4 || hdr[0] < 1 ||
+      hdr[0] > kVersion || hdr[3] == 0) {
     f.close();
     return false;
   }
@@ -241,10 +242,17 @@ bool MemoDoc::load(fs::FS& fs, const char* path) {
     s.width = b[1];
     s.pts.resize(n);
     if (f.read((uint8_t*)s.pts.data(), n * sizeof(Point)) != n * sizeof(Point)) break;
+    if (hdr[0] == 1) {  // px 単位から SUB 単位へ
+      s.width = std::min(255, s.width * SUB);
+      for (auto& p : s.pts) {
+        p.x *= SUB;
+        p.y *= SUB;
+      }
+    }
     s.updateBounds();
     strokes.push_back(std::move(s));
   }
   f.close();
-  dirty = false;
+  dirty = hdr[0] != kVersion;  // 旧形式は次の保存で新形式に書き換える
   return true;
 }

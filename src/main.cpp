@@ -51,11 +51,21 @@ int confirmDeleteIndex = -1;
 
 bool drawing = false;
 Stroke curStroke;
-Point lastPt;
+Point lastScreen;  // 直前のタッチ位置（画面 px）
+
+// 拡大表示。G39 で拡大、G37 で縮小、G38 で等倍。拡大中は左端の矢印ボタンで移動する
+constexpr float kZoomLevels[] = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+constexpr int kZoomCount = sizeof(kZoomLevels) / sizeof(kZoomLevels[0]);
+int zoomIdx = 0;
+float zoom = 1.0f;
+float viewX = 0, viewY = 0;           // 画面左上に来る元画像の座標
+M5Canvas viewCanvas(&M5.Display);     // 拡大時の表示内容
+constexpr int PAN_W = 64, PAN_H = 64, PAN_CELLS = 5;  // 倍率表示 + ↑←→↓
+constexpr int PAN_Y0 = (IMG_H - PAN_H * PAN_CELLS) / 2;
 
 // 画面更新は待たずに溜めておき、コントローラが空いた時に出す（タッチの読み取りを止めないため）
 struct Seg {
-  Point a, b;
+  Point a, b;  // SUB 単位の元画像座標。描く時に今の表示倍率で画面座標にする
   uint8_t width;
 };
 std::vector<Seg> pendingSegs;  // まだ画面に描いていないペンの線分
@@ -99,17 +109,41 @@ const Rect kImageRect = makeRect(0, 0, IMG_W, IMG_H);
 
 // ---------------------------------------------------------------- 描画
 
-void drawStroke(LovyanGFX& g, const Stroke& s) {
+bool zoomed() { return zoomIdx > 0; }
+
+Rect panRect() { return makeRect(0, PAN_Y0, PAN_W, PAN_H * PAN_CELLS); }
+void drawPanButtons();
+
+int dotRadius(float r) { return std::max(1, (int)lroundf(r)); }
+
+// 元画像 px（SUB 単位）を、原点 (ox, oy)・倍率 scale の座標系に描く。ピクセル中心どうしを合わせる
+void drawSeg(LovyanGFX& g, Point a, Point b, uint8_t width, float ox = 0, float oy = 0, float scale = 1) {
+  auto X = [&](const Point& p) { return (p.x / (float)SUB + 0.5f - ox) * scale - 0.5f; };
+  auto Y = [&](const Point& p) { return (p.y / (float)SUB + 0.5f - oy) * scale - 0.5f; };
+  float r = width * scale / SUB / 2;
+  if (a.x == b.x && a.y == b.y) g.fillCircle(lroundf(X(a)), lroundf(Y(a)), dotRadius(r), TFT_BLACK);
+  else g.drawWideLine(X(a), Y(a), X(b), Y(b), r, TFT_BLACK);
+}
+
+void drawStroke(LovyanGFX& g, const Stroke& s, float ox = 0, float oy = 0, float scale = 1) {
   if (s.pts.size() == 1) {
-    g.fillCircle(s.pts[0].x, s.pts[0].y, std::max(1, s.width / 2), TFT_BLACK);
+    drawSeg(g, s.pts[0], s.pts[0], s.width, ox, oy, scale);
     return;
   }
-  float r = s.width / 2.0f;
-  for (size_t i = 1; i < s.pts.size(); ++i) {
-    g.drawWideLine(s.pts[i - 1].x, s.pts[i - 1].y, s.pts[i].x, s.pts[i].y, r, TFT_BLACK);
+  for (size_t i = 1; i < s.pts.size(); ++i) drawSeg(g, s.pts[i - 1], s.pts[i], s.width, ox, oy, scale);
+}
+
+void drawLayers(LovyanGFX& g, const Rect& imgRect, float ox = 0, float oy = 0, float scale = 1) {
+  if (!currentId) return;
+  for (auto& l : doc.layers) {
+    if (!l.visible) continue;
+    for (auto& s : doc.strokes) {
+      if (!s.deleted && s.layerId == l.id && s.bounds.intersects(imgRect)) drawStroke(g, s, ox, oy, scale);
+    }
   }
 }
 
+// 等倍の合成画像（保存・スナップショット・等倍表示に使う）
 void compose(Rect r) {
   r = r.clipped(IMG_W, IMG_H);
   if (r.empty()) return;
@@ -119,25 +153,64 @@ void compose(Rect r) {
   } else {
     composeCanvas.fillRect(r.x, r.y, r.w, r.h, TFT_WHITE);
   }
-  if (currentId) {
-    for (auto& l : doc.layers) {
-      if (!l.visible) continue;
-      for (auto& s : doc.strokes) {
-        if (!s.deleted && s.layerId == l.id && s.bounds.intersects(r)) drawStroke(composeCanvas, s);
-      }
-    }
-  }
+  drawLayers(composeCanvas, r);
   composeCanvas.clearClipRect();
 }
 
-void pushImage(Rect r) {
-  r = r.clipped(IMG_W, IMG_H);
-  if (r.empty()) return;
+// 画面 px ⇔ 元画像
+Point screenToSub(int sx, int sy) {
+  float ix = (sx + 0.5f) / zoom + viewX - 0.5f, iy = (sy + 0.5f) / zoom + viewY - 0.5f;
+  int x = std::min(std::max((int)lroundf(ix * SUB), 0), IMG_W * SUB - 1);
+  int y = std::min(std::max((int)lroundf(iy * SUB), 0), IMG_H * SUB - 1);
+  return {(int16_t)x, (int16_t)y};
+}
+
+Rect imageToScreenRect(const Rect& r) {
+  if (!zoomed() || r.empty()) return r;
+  int x = floorf((r.x - viewX) * zoom) - 1, y = floorf((r.y - viewY) * zoom) - 1;
+  return makeRect(x, y, ceilf(r.w * zoom) + 3, ceilf(r.h * zoom) + 3);
+}
+
+Rect screenToImageRect(const Rect& r) {
+  if (!zoomed() || r.empty()) return r;
+  int x = floorf(viewX + r.x / zoom) - 1, y = floorf(viewY + r.y / zoom) - 1;
+  return makeRect(x, y, ceilf(r.w / zoom) + 3, ceilf(r.h / zoom) + 3);
+}
+
+// 拡大表示を画面 px の範囲 sr だけ作る。写真は補間して拡大し、線は拡大後の座標で描き直すのでぼけない
+void renderView(const Rect& sr) {
+  viewCanvas.setClipRect(sr.x, sr.y, sr.w, sr.h);
+  if (currentId && doc.baseVisible) {
+    float ox = (0.5f - viewX) * zoom - 0.5f, oy = (0.5f - viewY) * zoom - 0.5f;
+    baseCanvas.pushRotateZoomWithAA(&viewCanvas, ox, oy, 0, zoom, zoom);  // pivot は (0,0)
+  } else {
+    viewCanvas.fillRect(sr.x, sr.y, sr.w, sr.h, TFT_WHITE);
+  }
+  drawLayers(viewCanvas, screenToImageRect(sr), viewX, viewY, zoom);
+  viewCanvas.clearClipRect();
+}
+
+// 画面 px の範囲を今の表示（等倍 or 拡大）で描く。完了待ちはしない
+void pushScreenRect(Rect sr) {
+  if (sr.empty()) return;
+  LGFX_Sprite* src = &composeCanvas;
+  if (zoomed()) {
+    renderView(sr);
+    src = &viewCanvas;
+  }
+  M5.Display.setClipRect(sr.x, sr.y, sr.w, sr.h);
+  src->pushSprite(&M5.Display, 0, 0);
+  M5.Display.clearClipRect();
+  if (zoomed() && overlay != Overlay::Info && sr.intersects(panRect())) drawPanButtons();
+}
+
+// 元画像の範囲を描き直す。clipW より右（パネル）は描かない
+void pushView(const Rect& imgRect, int clipW = IMG_W) {
+  Rect sr = imageToScreenRect(imgRect).clipped(clipW, IMG_H);
+  if (sr.empty()) return;
   // 実行中の高速更新と範囲が重なると IT8951 が画素を取りこぼすので、終わるのを待つ
   M5.Display.waitDisplay();
-  M5.Display.setClipRect(r.x, r.y, r.w, r.h);
-  composeCanvas.pushSprite(&M5.Display, 0, 0);
-  M5.Display.clearClipRect();
+  pushScreenRect(sr);
 }
 
 void drawLabel(const char* text, int cx, int cy, const lgfx::IFont* font, uint16_t fg, uint16_t bg) {
@@ -146,6 +219,23 @@ void drawLabel(const char* text, int cx, int cy, const lgfx::IFont* font, uint16
   d.setTextDatum(textdatum_t::middle_center);
   d.setTextColor(fg, bg);
   d.drawString(text, cx, cy);
+}
+
+void drawPanButtons() {
+  auto& d = M5.Display;
+  Rect r = panRect();
+  d.fillRect(r.x, r.y, r.w, r.h, TFT_WHITE);
+  char buf[16];
+  if (zoom == floorf(zoom)) snprintf(buf, sizeof(buf), "%d倍", (int)zoom);
+  else snprintf(buf, sizeof(buf), "%.1f倍", zoom);
+  drawLabel(buf, PAN_W / 2, PAN_Y0 + PAN_H / 2, fontS, TFT_BLACK, TFT_WHITE);
+  const char* arrows[] = {"↑", "←", "→", "↓"};
+  for (int i = 0; i < 4; ++i) {
+    int y = PAN_Y0 + (i + 1) * PAN_H;
+    d.drawRoundRect(4, y + 4, PAN_W - 8, PAN_H - 8, 8, TFT_BLACK);
+    drawLabel(arrows[i], PAN_W / 2, y + PAN_H / 2, fontL, TFT_BLACK, TFT_WHITE);
+  }
+  d.drawRect(r.x, r.y, r.w, r.h, TFT_BLACK);
 }
 
 void drawButton(int i) {
@@ -360,9 +450,11 @@ Rect takePending() {
   Rect r = pendingErase;
   r.unite(pendingRefresh);
   for (auto& s : pendingSegs) {
-    int m = s.width / 2 + 2;
-    r.unite(makeRect(std::min(s.a.x, s.b.x) - m, std::min(s.a.y, s.b.y) - m, std::abs(s.a.x - s.b.x) + m * 2 + 1,
-                     std::abs(s.a.y - s.b.y) + m * 2 + 1));
+    Stroke tmp;
+    tmp.width = s.width;
+    tmp.pts = {s.a, s.b};
+    tmp.updateBounds();
+    r.unite(tmp.bounds);
   }
   pendingSegs.clear();
   pendingErase = Rect();
@@ -380,6 +472,11 @@ void redrawAll(epd_mode_t mode = epd_mode_t::epd_quality) {
   M5.Display.startWrite();
   if (overlay == Overlay::Info) {
     drawInfo();
+  } else if (zoomed()) {
+    renderView(kImageRect);
+    viewCanvas.pushSprite(&M5.Display, 0, 0);
+    drawPanButtons();
+    drawOverlayPanel();
   } else {
     composeCanvas.pushSprite(&M5.Display, 0, 0);
     drawOverlayPanel();
@@ -416,6 +513,9 @@ void scheduleSave() { saveDueMs = millis() + kSaveDelayMs; }
 
 void openPhoto(uint16_t id) {
   saveNow();
+  zoomIdx = 0;
+  zoom = 1.0f;
+  viewX = viewY = 0;
   overlay = Overlay::None;
   confirmDeleteIndex = -1;
   if (id && store::loadBase(id, baseCanvas)) {
@@ -490,7 +590,7 @@ void onPanelTap(int x, int y) {
     compose(kImageRect);
     M5.Display.setEpdMode(epd_mode_t::epd_quality);
     M5.Display.startWrite();
-    pushImage(makeRect(0, 0, PANEL_X, IMG_H));
+    pushView(kImageRect, PANEL_X);
     drawPanel();
     drawButton(B_LAYER);
     drawButton(B_UNDO);
@@ -575,7 +675,7 @@ void onToolbar(int i) {
       compose(r);
       M5.Display.setEpdMode(epd_mode_t::epd_quality);
       M5.Display.startWrite();
-      pushImage(r);
+      pushView(r);
       drawOverlayPanel();
       drawButton(B_UNDO);
       M5.Display.endWrite();
@@ -612,17 +712,8 @@ void flushPending() {
   // DU4(fastest) は灰色の上の画素を取りこぼすことがあるので白黒 2 値の DU(fast) で描く
   M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.startWrite();
-  for (auto& s : pendingSegs) {
-    // 点は drawStroke() の 1 点描画と同じ形にする
-    if (s.a.x == s.b.x && s.a.y == s.b.y) M5.Display.fillCircle(s.a.x, s.a.y, std::max(1, s.width / 2), TFT_BLACK);
-    else M5.Display.drawWideLine(s.a.x, s.a.y, s.b.x, s.b.y, s.width / 2.0f, TFT_BLACK);
-  }
-  Rect e = pendingErase.clipped(IMG_W, IMG_H);
-  if (!e.empty()) {
-    M5.Display.setClipRect(e.x, e.y, e.w, e.h);
-    composeCanvas.pushSprite(&M5.Display, 0, 0);
-    M5.Display.clearClipRect();
-  }
+  for (auto& s : pendingSegs) drawSeg(M5.Display, s.a, s.b, s.width, viewX, viewY, zoom);
+  pushScreenRect(imageToScreenRect(pendingErase).clipped(IMG_W, IMG_H));
   M5.Display.endWrite();
   pendingSegs.clear();
   pendingErase = Rect();
@@ -634,33 +725,32 @@ void refreshWhenIdle() {
   if ((int32_t)(millis() - refreshDueMs) < 0) return;
   if (!pendingSegs.empty() || !pendingErase.empty() || M5.Display.displayBusy()) return;
   bool panel = overlay == Overlay::Layers || overlay == Overlay::Settings;
-  Rect r = pendingRefresh.clipped(panel ? PANEL_X : IMG_W, IMG_H);
+  Rect sr = imageToScreenRect(pendingRefresh).clipped(panel ? PANEL_X : IMG_W, IMG_H);
   M5.Display.setEpdMode(epd_mode_t::epd_text);
   M5.Display.startWrite();
-  if (!r.empty() && overlay != Overlay::Info) {
-    M5.Display.setClipRect(r.x, r.y, r.w, r.h);
-    composeCanvas.pushSprite(&M5.Display, 0, 0);
-    M5.Display.clearClipRect();
-  }
+  if (overlay != Overlay::Info) pushScreenRect(sr);
   if (undoButtonStale) drawButton(B_UNDO);
   M5.Display.endWrite();
   pendingRefresh = Rect();
   undoButtonStale = false;
 }
 
+// a→b（SUB 単位）を等倍の合成画像に描き、画面には溜めて後で描く
 void penSegment(Point a, Point b) {
-  if (a.x == b.x && a.y == b.y) composeCanvas.fillCircle(a.x, a.y, std::max(1, curStroke.width / 2), TFT_BLACK);
-  else composeCanvas.drawWideLine(a.x, a.y, b.x, b.y, curStroke.width / 2.0f, TFT_BLACK);
+  drawSeg(composeCanvas, a, b, curStroke.width);
   pendingSegs.push_back({a, b, curStroke.width});
   flushPending();
 }
 
+// 画面 px の a→b をなぞって、触れた線を消す
 void eraseAlong(Point a, Point b) {
   int dx = b.x - a.x, dy = b.y - a.y;
   int steps = std::max(1, (int)(sqrtf(dx * dx + dy * dy) / (kEraserRadius / 2)));
+  int radius = std::max(2, (int)lroundf(kEraserRadius / zoom));  // 画面上で同じ大きさにする
   Rect hit;
   for (int i = 1; i <= steps; ++i) {
-    hit.unite(doc.eraseAt(a.x + dx * i / steps, a.y + dy * i / steps, kEraserRadius));
+    Point p = screenToSub(a.x + dx * i / steps, a.y + dy * i / steps);
+    hit.unite(doc.eraseAt(p.x / SUB, p.y / SUB, radius));
   }
   if (hit.empty()) return;
   compose(hit);
@@ -676,32 +766,36 @@ void beginStroke(int x, int y) {
     redrawAll();
   }
   drawing = true;
-  lastPt = {(int16_t)x, (int16_t)y};
+  lastScreen = {(int16_t)x, (int16_t)y};
   if (tool == Tool::Pen || tool == Tool::Stamp) {
     // 丸ポチは 1 点だけの線として保存する（消しゴム・戻す・レイヤーがそのまま効く）
+    // 太さは画面上で同じに見えるよう、拡大中は細く保存する
+    uint8_t screenWidth = tool == Tool::Stamp ? kStampSizes[widthIdx] : kPenWidths[widthIdx];
     curStroke = Stroke();
     curStroke.layerId = doc.activeLayer().id;
-    curStroke.width = tool == Tool::Stamp ? kStampSizes[widthIdx] : kPenWidths[widthIdx];
-    curStroke.pts.push_back(lastPt);
-    penSegment(lastPt, lastPt);
+    curStroke.width = std::min(255, std::max(1, (int)lroundf(screenWidth * SUB / zoom)));
+    Point p = screenToSub(x, y);
+    curStroke.pts.push_back(p);
+    penSegment(p, p);
   } else {
     doc.beginErase();
-    eraseAlong(lastPt, lastPt);
+    eraseAlong(lastScreen, lastScreen);
   }
 }
 
 void continueStroke(int x, int y) {
   if (tool == Tool::Stamp) return;  // 指が滑っても線にしない
   Point p = {(int16_t)std::min(std::max(x, 0), IMG_W - 1), (int16_t)std::min(std::max(y, 0), IMG_H - 1)};
-  int dx = p.x - lastPt.x, dy = p.y - lastPt.y;
+  int dx = p.x - lastScreen.x, dy = p.y - lastScreen.y;
   if (dx * dx + dy * dy < 4) return;
   if (tool == Tool::Pen) {
-    curStroke.pts.push_back(p);
-    penSegment(lastPt, p);
+    Point prev = curStroke.pts.back(), sp = screenToSub(p.x, p.y);
+    curStroke.pts.push_back(sp);
+    penSegment(prev, sp);
   } else {
-    eraseAlong(lastPt, p);
+    eraseAlong(lastScreen, p);
   }
-  lastPt = p;
+  lastScreen = p;
 }
 
 // ここでは画面を待たない。続けて次の線を書けるよう、描き直しは手が止まってから行う
@@ -717,6 +811,35 @@ void endStroke() {
   if (hadUndo == doc.undoStack.empty()) undoButtonStale = true;  // 「戻す」の有効/無効が変わった
   refreshDueMs = millis() + kRefreshIdleMs;
   if (doc.dirty) scheduleSave();
+}
+
+void clampView() {
+  viewX = std::min(std::max(viewX, 0.0f), IMG_W - IMG_W / zoom);
+  viewY = std::min(std::max(viewY, 0.0f), IMG_H - IMG_H / zoom);
+}
+
+// 表示中の中心を保ったまま倍率を変える
+void setZoom(int idx) {
+  idx = std::min(std::max(idx, 0), kZoomCount - 1);
+  if (idx == zoomIdx || !currentId || overlay == Overlay::Info) return;
+  float cx = viewX + IMG_W / zoom / 2, cy = viewY + IMG_H / zoom / 2;
+  zoomIdx = idx;
+  zoom = kZoomLevels[idx];
+  viewX = cx - IMG_W / zoom / 2;
+  viewY = cy - IMG_H / zoom / 2;
+  clampView();
+  uint32_t t0 = millis();
+  redrawAll();
+  Serial.printf("zoom %.1f redraw %lu ms\n", zoom, millis() - t0);
+}
+
+// 表示範囲の半分ずつ動かす
+void panBy(int dx, int dy) {
+  float ox = viewX, oy = viewY;
+  viewX += dx * IMG_W / zoom / 2;
+  viewY += dy * IMG_H / zoom / 2;
+  clampView();
+  if (viewX != ox || viewY != oy) redrawAll();
 }
 
 void handleTouch() {
@@ -745,6 +868,10 @@ void handleTouch() {
     else closeOverlayAndRedraw();
   } else if (overlay == Overlay::Info) {
     if (currentId) closeOverlayAndRedraw();
+  } else if (zoomed() && panRect().contains(x, y)) {
+    int cell = (y - PAN_Y0) / PAN_H;  // 0: 倍率表示, 1: ↑, 2: ←, 3: →, 4: ↓
+    const int dirs[][2] = {{0, 0}, {0, -1}, {-1, 0}, {1, 0}, {0, 1}};
+    if (cell > 0) panBy(dirs[cell][0], dirs[cell][1]);
   } else if (currentId) {
     beginStroke(x, y);
   }
@@ -753,10 +880,9 @@ void handleTouch() {
 // 表示待ちを出し切り、高速更新で荒れた部分も整える
 void settleDisplay() {
   Rect r = takePending();
-  if (overlay == Overlay::Layers || overlay == Overlay::Settings) r = r.clipped(PANEL_X, IMG_H);
   if (overlay != Overlay::Info && !r.empty()) {
     M5.Display.setEpdMode(epd_mode_t::epd_text);
-    pushImage(r);
+    pushView(r, overlay == Overlay::None ? IMG_W : PANEL_X);
   }
   M5.Display.waitDisplay();
 }
@@ -875,12 +1001,13 @@ void setup() {
   LittleFS.remove(kResumeFlag);
   if (!resumed) showBusy("起動中…");
 
-  for (auto* c : {&baseCanvas, &composeCanvas}) {
+  for (auto* c : {&baseCanvas, &composeCanvas, &viewCanvas}) {
     c->setPsram(true);
     c->setColorDepth(lgfx::color_depth_t::grayscale_8bit);
     if (!c->createSprite(IMG_W, IMG_H)) fatal("メモリ不足");
     c->fillScreen(TFT_WHITE);
   }
+  baseCanvas.setPivot(0, 0);  // 拡大描画の基準を左上に（createSprite で中央に戻るので後で設定）
 
   web::begin();
 
@@ -911,9 +1038,9 @@ void loop() {
   web::loop();
 
   if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed()) lastActivityMs = millis();
-  if (M5.BtnA.wasPressed()) stepPhoto(-1);
-  if (M5.BtnC.wasPressed()) stepPhoto(1);
-  if (M5.BtnB.wasPressed()) onToolbar(B_REFRESH);
+  if (M5.BtnA.wasPressed()) setZoom(zoomIdx - 1);  // G37: 縮小
+  if (M5.BtnC.wasPressed()) setZoom(zoomIdx + 1);  // G39: 拡大
+  if (M5.BtnB.wasPressed()) setZoom(0);            // G38: 等倍
 
   uint32_t now = millis();
   if (infoStale) {

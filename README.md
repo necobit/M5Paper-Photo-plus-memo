@@ -84,3 +84,13 @@ pio run -t upload
 - `/p/NNNN.g4` … 元画像。6 バイトヘッダ（`G4` + 幅 + 高さ）+ 4bit グレー（Floyd-Steinberg 済み）
 - `/p/NNNN.memo` … レイヤー一覧 + ストローク（レイヤー ID・太さ・座標列）
 - `/wifi.txt` … SSID とパスワード
+
+## 電池の 0% 電圧の計測（tools/battery_drain）
+
+本体アプリの代わりに書き込む消費加速テスト。Wi-Fi スキャン連続・BLE 送受信・CPU 全開で電池を減らし、電池駆動中は 30 秒ごとに電圧と筐体内温度を `/drain.csv` に記録する。筐体内が 50℃ になると負荷を止め、45℃ で再開する。パーティション表は共通なので写真とメモは残る。
+
+```sh
+cd tools/battery_drain && pio run -t upload   # テストを書き込む
+# 満充電 → USB を抜いて電源が落ちるまで放置 → USB を挿すと前回の記録の要約が画面とシリアルに出る
+cd ../.. && pio run -t upload                 # 本体アプリに戻す
+```

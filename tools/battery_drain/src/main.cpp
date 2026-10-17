@@ -1,8 +1,9 @@
 // 電池の 0% 電圧を測るための消費加速テスト
 //   - Wi-Fi スキャン連続 + BLE アドバタイズ / スキャン + CPU 全開で電池を早く減らす
 //   - 電池駆動中は 30 秒ごとに電圧を /drain.csv に追記（電源が落ちる直前の値 = 0% の電圧）
-//   - 起動時に前回の記録を /drain_prev.csv に移し、要約を画面とシリアルに出す
-//   - USB 給電中は記録しない（結果を見るために起動しても記録を上書きしない）
+//   - 起動時に前回の記録を /drain_N.csv（N は空いている番号）に移し、要約を画面とシリアルに出す。過去の記録は消さない
+//     （空になった電池を USB で充電し始めると電圧が給電判定より低く、記録が始まってしまうため。上書きすると本番の記録が消える）
+//   - USB 給電中は記録しない
 //   - 基板の温湿度センサー(SHT30)で筐体内温度を監視し、50℃で負荷を止め 45℃で再開する（電池の保護）
 #include <BLEDevice.h>
 #include <LittleFS.h>
@@ -15,13 +16,15 @@ constexpr int kUsbPowerMv = 4100;  // 本体アプリと同じ判定
 constexpr uint32_t kLogIntervalMs = 30000;
 constexpr uint32_t kDisplayIntervalMs = 60000;
 const char* kLogFile = "/drain.csv";
-const char* kPrevFile = "/drain_prev.csv";
+constexpr uint32_t kBleRestartMs = 60000;  // BLE スキャン結果はメモリに溜まり続けるので定期的に捨てる
 
 bool fsOk = false;
 bool logging = false;
 uint32_t logStartMs = 0;
 uint32_t nextLogMs = 0;
 uint32_t nextDisplayMs = 0;
+uint32_t nextBleRestartMs = 0;
+String prevFile;
 int startMv = 0;
 int lastLoggedMv = 0;
 volatile uint32_t burnCount = 0;
@@ -54,28 +57,22 @@ float readTempC() {
   return -45.0f + 175.0f * ((buf[0] << 8) | buf[1]) / 65535.0f;
 }
 
-// 前回の記録を退避して要約を作る
+// 前回の記録を空いている番号のファイルに移して要約を作る（記録が無ければ最新の退避分を読む）
 void rotatePreviousLog() {
-  if (!fsOk || !LittleFS.exists(kLogFile)) {
-    if (fsOk && LittleFS.exists(kPrevFile)) {
-      // 既に退避済みの前回分を読む
-    } else {
-      return;
-    }
+  if (!fsOk) return;
+  int n = 1;
+  while (LittleFS.exists("/drain_" + String(n) + ".csv")) ++n;
+  if (LittleFS.exists(kLogFile)) {
+    prevFile = "/drain_" + String(n) + ".csv";
+    LittleFS.rename(kLogFile, prevFile);
+  } else if (n > 1) {
+    prevFile = "/drain_" + String(n - 1) + ".csv";
   } else {
-    File f = LittleFS.open(kLogFile, FILE_READ);
-    size_t size = f ? f.size() : 0;
-    if (f) f.close();
-    if (size > 0) {
-      LittleFS.remove(kPrevFile);
-      LittleFS.rename(kLogFile, kPrevFile);
-    } else {
-      LittleFS.remove(kLogFile);
-    }
+    return;
   }
-  File f = LittleFS.open(kPrevFile, FILE_READ);
+  File f = LittleFS.open(prevFile, FILE_READ);
   if (!f) return;
-  Serial.println("---- previous drain log (sec,mV,degC) ----");
+  Serial.printf("---- previous drain log %s (sec,mV,degC) ----\n", prevFile.c_str());
   while (f.available()) {
     String line = f.readStringUntil('\n');
     Serial.println(line);
@@ -212,7 +209,7 @@ void drawStatus(int mv) {
   y = 360;
   d.drawFastHLine(30, y - 12, 900, TFT_DARKGREY);
   if (prev.valid) {
-    line("前回の記録: " + volts(prev.firstMv) + " → 最後 " + volts(prev.lastMv) + "（最低 " + volts(prev.minMv) +
+    line(prevFile.substring(1) + ": " + volts(prev.firstMv) + " → 最後 " + volts(prev.lastMv) + "（最低 " + volts(prev.minMv) +
          "）");
     line("持続 " + hms(prev.lastSec) + "  記録 " + String(prev.samples) + " 点");
     line("最後の電圧 ≒ 動かなくなる電圧（0%）");
@@ -261,7 +258,6 @@ void loop() {
         logging = true;
         logStartMs = now;
         startMv = mv;
-        if (fsOk) LittleFS.remove(kLogFile);
       }
       appendLog(mv);
       lastLoggedMv = mv;
@@ -272,6 +268,14 @@ void loop() {
   if ((int32_t)(now - nextDisplayMs) >= 0) {
     nextDisplayMs = now + kDisplayIntervalMs;
     drawStatus(readBatteryMv());
+  }
+
+  if (!paused && (int32_t)(now - nextBleRestartMs) >= 0) {
+    nextBleRestartMs = now + kBleRestartMs;
+    BLEScan* scan = BLEDevice::getScan();
+    scan->stop();
+    scan->clearResults();
+    scan->start(0, nullptr, false);
   }
 
   // コア 1 も回し続ける

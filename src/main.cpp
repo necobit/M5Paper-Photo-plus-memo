@@ -222,12 +222,19 @@ void drawLabel(const char* text, int cx, int cy, const lgfx::IFont* font, uint16
 }
 
 // ---- 電池残量 ----
-// M5Paper には残量計 IC が無く、電圧から推定するしかない。実機の読みに合わせて 2 点の線形補間で換算する。
+// M5Paper には残量計 IC が無く、電圧から推定するしかない。実機の読みを折れ線で換算する。
 //   満充電: 充電後に抜いて 3 分で 3.91V（実測 2026-10-17）
-//   空    : 未測定。M5Unified の 0% (3.30V) を満充電の実測と同じだけ（-0.24V）ずらした値
+//   途中  : 消費テストの実測（tools/battery_drain/data/drain_2026-10-17.csv）。一定負荷で 2 時間 37 分動いたので、
+//           経過時間の割合を残量とした。終盤は急に落ち、残り 10% (3.52V) から 15 分ほどで 3.01V になり止まった
 // 給電中は 4.31V 前後を読むので、kUsbPowerMv 以上は充電中とみなす
-constexpr int kBatteryFullMv = 3910;
-constexpr int kBatteryEmptyMv = 3060;
+struct BatteryPoint {
+  int mv;
+  int pct;
+};
+constexpr BatteryPoint kBatteryCurve[] = {
+    {3910, 100}, {3860, 90}, {3810, 80}, {3730, 70}, {3690, 60}, {3665, 50}, {3640, 40},
+    {3615, 30},  {3575, 20}, {3525, 10}, {3465, 5},  {3300, 2},  {3050, 0},
+};
 constexpr int kUsbPowerMv = 4100;
 
 int readBatteryMv() {
@@ -237,8 +244,13 @@ int readBatteryMv() {
 }
 
 int batteryPercent(int mv) {
-  int pct = (mv - kBatteryEmptyMv) * 100 / (kBatteryFullMv - kBatteryEmptyMv);
-  return std::min(100, std::max(0, pct));
+  if (mv >= kBatteryCurve[0].mv) return 100;
+  for (size_t i = 1; i < sizeof(kBatteryCurve) / sizeof(kBatteryCurve[0]); ++i) {
+    const BatteryPoint& hi = kBatteryCurve[i - 1];
+    const BatteryPoint& lo = kBatteryCurve[i];
+    if (mv >= lo.mv) return lo.pct + (mv - lo.mv) * (hi.pct - lo.pct) / (hi.mv - lo.mv);
+  }
+  return 0;
 }
 
 void drawPanButtons() {

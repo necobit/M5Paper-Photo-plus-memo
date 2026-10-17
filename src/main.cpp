@@ -221,6 +221,26 @@ void drawLabel(const char* text, int cx, int cy, const lgfx::IFont* font, uint16
   d.drawString(text, cx, cy);
 }
 
+// ---- 電池残量 ----
+// M5Paper には残量計 IC が無く、電圧から推定するしかない。実機の読みに合わせて 2 点の線形補間で換算する。
+//   満充電: 充電後に抜いて 3 分で 3.91V（実測 2026-10-17）
+//   空    : 未測定。M5Unified の 0% (3.30V) を満充電の実測と同じだけ（-0.24V）ずらした値
+// 給電中は 4.31V 前後を読むので、kUsbPowerMv 以上は充電中とみなす
+constexpr int kBatteryFullMv = 3910;
+constexpr int kBatteryEmptyMv = 3060;
+constexpr int kUsbPowerMv = 4100;
+
+int readBatteryMv() {
+  int sum = 0;
+  for (int i = 0; i < 16; ++i) sum += M5.Power.getBatteryVoltage();
+  return sum / 16;
+}
+
+int batteryPercent(int mv) {
+  int pct = (mv - kBatteryEmptyMv) * 100 / (kBatteryFullMv - kBatteryEmptyMv);
+  return std::min(100, std::max(0, pct));
+}
+
 void drawPanButtons() {
   auto& d = M5.Display;
   Rect r = panRect();
@@ -290,7 +310,13 @@ void drawButton(int i) {
       if (currentId && pos < (int)ids.size()) snprintf(buf, sizeof(buf), "%d/%d", pos + 1, (int)ids.size());
       else snprintf(buf, sizeof(buf), "-/%d", (int)ids.size());
       drawLabel(buf, cx, y + 12, fontS, fg, bg);
-      snprintf(buf, sizeof(buf), "%d%%", (int)M5.Power.getBatteryLevel());
+      {
+        int mv = readBatteryMv();
+        // 較正用に電圧も出す（例: 85% 3.98）
+        if (mv >= kUsbPowerMv) snprintf(buf, sizeof(buf), "充電 %d.%02d", mv / 1000, mv % 1000 / 10);
+        else snprintf(buf, sizeof(buf), "%d%% %d.%02d", batteryPercent(mv), mv / 1000, mv % 1000 / 10);
+        Serial.printf("battery %d mV\n", mv);
+      }
       drawLabel(buf, cx, y + 30, fontS, inv ? TFT_LIGHTGREY : TFT_DARKGREY, bg);
       drawLabel("設定", cx, y + 48, fontS, fg, bg);  // タップで設定パネル
       break;
